@@ -871,6 +871,15 @@ function commandText(output, maxLines) {
 // widget's host.launch, a text widget's tap) and links as argv.
 var LAUNCH = "omamobile-launch"
 
+// A desktop entry that runs omarchy-shell opens a shell surface (the
+// Updates entry summons the update sheet), never a window, so Omarchy's
+// launch toast would wait for a toplevel that doesn't come and sit over the
+// sheet until it times out: no toast for it.
+function opensShellSurface(entry) {
+  var command = entry && entry.command ? entry.command : []
+  return command.length > 0 && String(command[0]).replace(/^.*\//, "") === "omarchy-shell"
+}
+
 function appLaunchArgv(desktopId) {
   return [LAUNCH, "app", String(desktopId || "")]
 }
@@ -883,8 +892,137 @@ function urlLaunchArgv(url) {
   return [LAUNCH, "url", String(url || "")]
 }
 
+// ---------------------------------------------------------------- who can see it
+
+// Shell surfaces that cover the whole home screen while they are mapped:
+// recent apps and the full-screen call card. The app drawer isn't here: its
+// surface stays mapped for the life of the shell (a new layer surface's
+// first frames draw at the wrong scale), so Home.qml asks it how far open
+// it is instead (DrawerLink.js). Hyprland says
+// when a layer surface maps and unmaps (openlayer>>NAMESPACE,
+// closelayer>>NAMESPACE); the quick-settings shade isn't here, since it
+// covers only part of the screen.
+var COVERING_LAYERS = ["omamobile-switcher", "omamobile-call"]
+
+// The covering surfaces mapped after one Hyprland event: { namespace: count }
+// (a surface per screen counts once each). Anything else returns `open`.
+function layersAfter(open, name, data) {
+  var ns = String(data || "").trim()
+  if ((name !== "openlayer" && name !== "closelayer") || COVERING_LAYERS.indexOf(ns) < 0) return open || {}
+  var next = {}
+  for (var k in open || {}) next[k] = open[k]
+  var n = (next[ns] || 0) + (name === "openlayer" ? 1 : -1)
+  if (n > 0) next[ns] = n
+  else delete next[ns]
+  return next
+}
+
+// Whether anyone can see the home screen: the panel is on, no app is on
+// the workspace and no covering surface is mapped. (The lock covers it too,
+// but tells no one; it blanks the panel soon after, which counts.)
+function homeShown(panelOff, appOnScreen, covering) {
+  return !panelOff && !appOnScreen && Object.keys(covering || {}).length === 0
+}
+
+// Whether a page's widgets can be seen: the home screen shows and the page
+// is the current one, or its neighbour while the pages are being swiped.
+function pageShown(page, current, moving, shown) {
+  if (!shown) return false
+  return page === current || (!!moving && Math.abs(page - current) === 1)
+}
+
+// A periodic job that waited while its widget was hidden is due when it is
+// shown again if its period passed since it last ran (or it never ran).
+function overdue(lastMs, periodMs, nowMs) {
+  return !(lastMs > 0) || nowMs - lastMs >= periodMs
+}
+
+// ---------------------------------------------------------------- gestures
+//
+// Paging: the pager's own drag moves the pages 1:1 under the finger; on
+// release HomePager.qml settles on the page these choose, with a short
+// ease that starts at the finger's speed.
+
+// A release at least this fast (logical px/s) turns the page its way even
+// after a short swipe; slower, the nearer page wins (past half the width).
+var PAGE_FLING = 300
+// A fling that moved less than this (px) is a tap's jitter, not a swipe.
+var PAGE_FLING_MIN = 8
+
+// The page to settle on: offset is the pages' scroll (px from page 0),
+// width a page's width, speed the scroll's speed (px/s, positive toward
+// the next page). Never more than one page from the page the swipe left.
+function pageAfterSwipe(offset, width, count, speed) {
+  var n = Math.max(1, Math.floor(Number(count) || 1))
+  var w = Number(width) || 0
+  if (!(w > 0)) return 0
+  var pos = (Number(offset) || 0) / w
+  var eps = PAGE_FLING_MIN / w
+  var v = Number(speed) || 0
+  var page
+  if (v >= PAGE_FLING) page = Math.ceil(pos - eps)
+  else if (v <= -PAGE_FLING) page = Math.floor(pos + eps)
+  else page = Math.round(pos)
+  return Math.max(0, Math.min(n - 1, page))
+}
+
+// How long a settle takes (ms) for `distance` px of a `span` px travel:
+// 120 ms plus up to 130 ms with the distance (a whole page 250 ms, half a
+// page about 185 ms), and no slower than the finger was moving, so a flick
+// carries on at its own speed (Easing.OutCubic starts at three times its
+// average speed). The drawer's settle (LauncherModel.settleMs) is the same
+// curve over its own travel.
+function settleMs(distance, span, speed) {
+  var d = Math.abs(Number(distance) || 0)
+  if (d < 0.5) return 0
+  var byDistance = 120 + 130 * Math.min(1, d / Math.max(1, Number(span) || 1))
+  var v = Math.abs(Number(speed) || 0)
+  var bySpeed = v > 0 ? 3 * d / v * 1000 : Infinity
+  return Math.round(Math.max(120, Math.min(byDistance, bySpeed)))
+}
+
+// A finger's speed from its recent positions, as LauncherModel's: samples
+// are { t (ms), pos (px) }, newest last; only the last 100 ms count, so a
+// finger that stopped before letting go has no speed.
+var SAMPLE_WINDOW_MS = 100
+function addSample(samples, t, pos) {
+  var out = []
+  for (var i = 0; i < (samples || []).length; i++)
+    if (t - samples[i].t <= SAMPLE_WINDOW_MS * 2) out.push(samples[i])
+  out.push({ t: t, pos: pos })
+  return out
+}
+function speedOf(samples, now) {
+  var recent = []
+  for (var i = 0; i < (samples || []).length; i++)
+    if (now - samples[i].t <= SAMPLE_WINDOW_MS) recent.push(samples[i])
+  if (recent.length < 2) return 0
+  var a = recent[0], b = recent[recent.length - 1]
+  var dt = b.t - a.t
+  return dt >= 8 ? (b.pos - a.pos) / dt * 1000 : 0
+}
+
+// The swipe up to the app drawer (DrawerSwipe.qml) is the home screen's
+// only while nothing is over it: no app on the workspace, not editing (no
+// widget being dragged either), no sheet open.
+function drawerSwipeAllowed(appOnScreen, editing, sheet) {
+  return !appOnScreen && !editing && !sheet
+}
+
+// Without the drawer in reach (DrawerLink.js missing), a swipe up opens it
+// through the host when the finger lets go: a fling up, or 80 px up.
+var DRAWER_FALLBACK_PX = 80
+var DRAWER_FALLBACK_FLING = 350
+function drawerFallbackOpens(travel, speed) {
+  var v = Number(speed) || 0
+  if (v >= DRAWER_FALLBACK_FLING) return false
+  return v <= -DRAWER_FALLBACK_FLING || (Number(travel) || 0) >= DRAWER_FALLBACK_PX
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
+    PAGE_FLING: PAGE_FLING, PAGE_FLING_MIN: PAGE_FLING_MIN, pageAfterSwipe: pageAfterSwipe, settleMs: settleMs,
+    addSample: addSample, speedOf: speedOf, drawerSwipeAllowed: drawerSwipeAllowed, drawerFallbackOpens: drawerFallbackOpens,
     LAUNCH: LAUNCH, appLaunchArgv: appLaunchArgv, commandLaunchArgv: commandLaunchArgv, urlLaunchArgv: urlLaunchArgv,
     VERSION: VERSION, GRID: GRID, LIMITS: LIMITS, REGISTRY: REGISTRY, DEFAULT_APPS: DEFAULT_APPS,
     WIDGET_ORDER: WIDGET_ORDER, PORTED: PORTED, PORTED_ORDER: PORTED_ORDER,
@@ -904,6 +1042,7 @@ if (typeof module !== "undefined") {
     addPage: addPage, removePage: removePage, movePage: movePage, setHome: setHome, setGrid: setGrid, transposeLayout: transposeLayout,
     weatherText: weatherText, geocodeUrl: geocodeUrl, forecastUrl: forecastUrl,
     parseGeocode: parseGeocode, parseForecast: parseForecast, parseAgenda: parseAgenda, AGENDA_ARGV: AGENDA_ARGV,
-    monthGrid: monthGrid, commandText: commandText
+    monthGrid: monthGrid, commandText: commandText, opensShellSurface: opensShellSurface,
+    COVERING_LAYERS: COVERING_LAYERS, layersAfter: layersAfter, homeShown: homeShown, pageShown: pageShown, overdue: overdue
   }
 }

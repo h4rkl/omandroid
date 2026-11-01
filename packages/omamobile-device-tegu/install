@@ -1,21 +1,28 @@
 #!/bin/bash
 # SPDX-License-Identifier: MIT
-# Install tested boot and touch policy; boot-success and other peripherals
-# require separate device qualification.
+# Stage omamobile-device-tegu into DESTDIR. Never activates anything: the
+# graphics start and the USB rescue are enabled by vendor wants links, as
+# omarchy-mac does; the AoC start ships with no link (see README.md).
+#   ./install DESTDIR [BUILDDIR]   (BUILDDIR holds the compiled C tools)
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 destination=${1:?Usage: ./install DESTDIR [BUILDDIR]}
 build=${2:-build}
 [[ $destination == /* && $destination != "/" ]] || { echo "Use an absolute staging directory" >&2; exit 1; }
-
-install -Dm755 "$build/reboot-to" "$destination/usr/bin/reboot-to"
-install -Dm755 bin/omamobile-tegu-touch-start "$destination/usr/lib/omamobile/tegu-touch-start"
+for file in bin/*; do install -Dm755 "$file" "$destination/usr/bin/${file##*/}"; done
+for tool in reboot-to tegu-tcpc-switch; do install -Dm755 "$build/$tool" "$destination/usr/bin/$tool"; done
 while IFS= read -r -d '' file; do
-  install -Dm644 "$file" "$destination/usr/lib/${file#vendor/}"
+  mode=644
+  [[ $file == vendor/systemd/system-sleep/* ]] && mode=755
+  install -Dm$mode "$file" "$destination/usr/lib/${file#vendor/}"
 done < <(find vendor -type f -print0)
-install -d "$destination/usr/lib/systemd/system/timers.target.wants"
-ln -sfn ../omamobile-tegu-touch-start.timer \
-  "$destination/usr/lib/systemd/system/timers.target.wants/omamobile-tegu-touch-start.timer"
+while IFS= read -r -d '' file; do
+  install -d "$destination/usr/lib/$(dirname "${file#vendor/}")"
+  ln -sfn "$(readlink "$file")" "$destination/usr/lib/${file#vendor/}"
+done < <(find vendor -type l -print0)
+# The session's side of the graphics start, sourced by uwsm from the XDG
+# data dirs (uwsm-libexec/prepare-env.sh walks XDG_DATA_DIRS too).
+install -Dm644 uwsm/env.d/omamobile-tegu-graphics "$destination/usr/share/uwsm/env.d/omamobile-tegu-graphics"
 install -Dm644 device.conf "$destination/usr/share/omamobile/device.conf"
 install -Dm644 etc/omamobile-mirrorlist "$destination/etc/pacman.d/omamobile-mirrorlist"
 install -Dm644 LICENSE "$destination/usr/share/licenses/omamobile-device-tegu/LICENSE"

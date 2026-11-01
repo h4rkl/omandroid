@@ -73,7 +73,7 @@ Bring-up tools (`*-stage`, `display-hz`, `usbc-deadman`) stay per plan: they pok
 | `VENDOR_CMDLINE` | `console=tty0 earlycon=exynos4210,0x10A00000 …` | `vendor_boot` command line (kernel arguments really go in `/chosen/bootargs`) |
 | `VENDOR_PAGESIZE` | `0x800` | Page size of `vendor_boot` (and `vendor_kernel_boot`, where the device has one) |
 | `OS_VERSION`, `OS_PATCH_LEVEL` | `17.0.0`, `2026-07` | The `init_boot` header values (the `boot` header's, on a device without `init_boot`) |
-| `AVB_FOOTERS` | (zuma and the Pixel 7a: `boot:0x4000000 init_boot:0x800000`) | Optional. For a bootloader whose `vbmeta` chains these partitions and, even unlocked, refuses one with no AVB footer (zuma; the Pixel 7a too, though the Pixel 7 Pro's bootloader, the same build, takes images without one). `image:partition_size`, each a `BOOT_IMAGES` entry, once; the size is the slot's partition size in bytes (stock's footer, `avbtool info_image`, or `fastboot getvar partition-size:<name>_b`), a multiple of 4096. `images` adds a hash footer to each, padding it to that size, signed with AOSP's test key (an unlocked bootloader accepts any key); needs `external/avb` under `SRC_DIR` (or `AVBTOOL`, `AVB_KEY`) and `openssl` |
+| `AVB_FOOTERS` | (zuma, the Pixel 7a and the Pixel 7 Pro: `boot:0x4000000 init_boot:0x800000`) | Optional. For a phone whose `vbmeta_b` chains these partitions, as stock's does: libavb takes a chained partition with no AVB footer as invalid metadata, which an unlocked bootloader doesn't let through (zuma; the Pixel 7a; the Pixel 7 Pro, device/cheetah/NOTES.md 2026-10-28). A `vbmeta_b` that lists them as hash descriptors, or has verification disabled, never reads the footers. `image:partition_size`, each a `BOOT_IMAGES` entry, once; the size is the slot's partition size in bytes (stock's footer, `avbtool info_image`, or `fastboot getvar partition-size:<name>_b`), a multiple of 4096. `images` adds a hash footer to each, padding it to that size, signed with AOSP's test key (an unlocked bootloader accepts any key); needs `external/avb` under `SRC_DIR` (or `AVBTOOL`, `AVB_KEY`) and `openssl` |
 | `AVB_ROLLBACK_INDEX`, `AVB_SECURITY_PATCH` | `1791158400`, `2026-10-05` | Required with `AVB_FOOTERS`, refused without it: stock's rollback index and `com.android.build.<image>.security_patch` from its footers. Never set the index above stock's: an index the bootloader stores locks stock's own images out of slot A. The `os_version` property is `OS_VERSION`'s major |
 | `BOOT_METHOD` | `android-v4` (default when omitted) | Generic images, flash, push and installer accept only `android-v4`; other methods are refused before phone access. `ram-only` marks a probe with no persistent install support |
 | `BOOT_IMAGES` | `boot init_boot vendor_boot vendor_kernel_boot dtbo` | The images written to slot B (the `_b` suffix is added by the tools and is not configurable). `boot`, `vendor_boot` and `dtbo` are always there. Without `init_boot`, `boot` carries the empty generic ramdisk and the OS version; without `vendor_kernel_boot`, `vendor_boot` carries the DTB and the initramfs (the Pixel 6: `boot vendor_boot dtbo`) |
@@ -223,6 +223,8 @@ The kernel is not touched: it still reaches the phone through `bin/omamobile pus
 
 **The phone's update UI** is `omamobile-shell`'s `omamobile.update` sheet: a toast when Omarchy has a release (tap to open) and Update > Omarchy in the menu open it; it shows what's new, the battery and the phone patches, asks for the PIN, shows progress with the output under Details, and ends on the result. The run is a systemd user unit, so it survives the shell restart at its end.
 
+**Kernel module trees.** Omarchy enables `kernel-modules-hook`'s `linux-modules-cleanup.service`, which at every boot moves each `/usr/lib/modules/<release>` that isn't running and that no package owns into `.old`. A phone's kernels come from `bin/omamobile push`, so a boot between a push and the reboot into the new kernel took the next kernel's modules away (seen on the Pixel 7 on 2026-10-27). `omamobile-omarchy` 0.1.14 holds that unit off with a drop-in and runs `omamobile-modules-cleanup.timer` ten minutes after boot instead: it keeps the running release, the release `modules-push` last pushed (named in `/usr/lib/modules/.omamobile-next`), every tree pushed during this boot, every tree stamped before 2026 (a reset clock), every pacman-owned tree and the two newest others, and removes the rest (`/usr/lib/omamobile-omarchy/modules-cleanup --dry-run` shows what it would do). A removed tree comes back with the next `push`, which re-sends a tree whose `.omamobile-tarball` marker is missing. It never touches `.old`, which kernel-modules-hook's own tmpfiles rule empties.
+
 ## 6. Release bundles and the installer
 
 For a first install, or to recover a phone that won't boot. One bundle per device per release.
@@ -232,7 +234,7 @@ For a first install, or to recover a phone that won't boot. One bundle per devic
 | Piece | Where | Notes |
 | --- | --- | --- |
 | aarch64 packages without a phone | `tools/build-packages` | makepkg in an Arch Linux ARM container (the official tarball, MD5 and signature checked against the pinned build key, `tools/lib/alarm.sh`) under the laptop's qemu-user; signs with `keys/` into `out/repo/aarch64`. Mesa, Hyprland and libcamera take hours this way, so they're built only when named, once per version |
-| The shared root image | `tools/build-rootfs`, `rootfs/` | pacstrap in that container: `rootfs/packages.base`, then Omarchy's own `install/omarchy-base.packages` (minus `rootfs/packages.omarchy-skip` and what isn't built for aarch64), then `rootfs/packages.omamobile`, the device package and the board's `ROOTFS_PACKAGES`, the `[omamobile]` repository itself, the kernel modules of the current build, and `patches/omarchy`. Output `out/omamobile-rootfs-<date>-aarch64.img.zst`, `.sha256` and a `MANIFEST` with every package version (also inside, `/usr/share/omamobile/rootfs/MANIFEST`) |
+| The device's root image | `tools/build-rootfs`, `rootfs/` | pacstrap in that container: `rootfs/packages.base`, then Omarchy's own `install/omarchy-base.packages` (minus `rootfs/packages.omarchy-skip` and what isn't built for aarch64), then `rootfs/packages.omamobile`, the device package and the board's `ROOTFS_PACKAGES`, the `[omamobile]` repository itself, the kernel modules of the current build, and `patches/omarchy`. Output `out/omamobile-rootfs-<codename>-<date>-aarch64.img.zst`, `.sha256` and a `MANIFEST` with every package version (also inside, `/usr/share/omamobile/rootfs/MANIFEST`) |
 | First boot | `packages/omamobile-firstboot` | reads `/etc/omamobile/firstboot.conf` (data, never sourced), creates the user, SSH keys, ufw with SSH on `usb0`, runs Omarchy's own setup leaves (skipping four that don't fit a phone), SDDM autologin and the lock, Omarchy's and our user setup, then deletes the file |
 | Growing the root | `initramfs/init` (`grow_root`) | `resize2fs` before mounting, only for a file system labelled `omamobile-root` smaller than its partition; `omamobile.noresize` skips it |
 | The installer | `tools/install-phone` (the bundle's `install`) | as described below, steps 1, 3-5; the factory-image step (2) is `tools/phone-provision` after the first boot instead |
@@ -240,6 +242,8 @@ For a first install, or to recover a phone that won't boot. One bundle per devic
 | Per-phone data | `tools/phone-provision` | the extract tools on the user's factory image, pushed over USB SSH, plus the phone's own backup (modem board id and NV checksums, camera data, settings, home screens, fingerprint state only with `--fingerprint`) |
 
 Decisions taken in building it: the device packages are **installed** in the image, not only cached (one device so far; a first boot without a package step has one less way to fail; §12 decision 6 stays open for the second device); the image's `[omarchy]` is Omarchy's **stable** channel (from 2026-10-20; before that edge was the only one with aarch64 builds of `omarchy`, `omarchy-settings` and `quickshell`, and edge then moved to 4.5.0rc1, which the phone's patches don't apply to); the image is per device (its `MANIFEST` names the device, and the installer refuses a mismatch).
+
+Root image filenames include the device so two devices can share a version without overwriting each other. Builds use separate temporary directories and refuse a concurrent build of the same device/version in the same output directory. Compression and smoke checks finish before replacing the published files. `--local NAME` still uses `out/NAME/repo` and writes images under `out/NAME/`; use `--rootfs` to select one there. Independent package snapshots also need separate `ALARM_CACHE` directories (§10). Repository-mode installation and bundling select only images whose root `MANIFEST` matches the device, including older filenames.
 
 The design:
 
@@ -251,11 +255,13 @@ omamobile-<codename>-<version>/
   images/boot.img init_boot.img vendor_boot.img vendor_kernel_boot.img dtbo.img
   MANIFEST                          kernel release, package versions, both repositories' commits
   SHA256SUMS  SHA256SUMS.sig        checksums of everything above, signed
-omamobile-rootfs-<version>-aarch64.img.zst   shared by every device, downloaded once
-  .sha256 .sig
+omamobile-rootfs-<codename>-<version>-aarch64.img.zst
+  .sha256 .MANIFEST
 ```
 
-**The shared root image** is an ext4 Arch Linux ARM root with Omarchy, the `[omamobile]` repository configured and its keyring, `linux-omamobile`, `omamobile-shell` and every device package in the package cache but **none installed**. It is built by `pacstrap` in an aarch64 container. It contains no Google file. Its size is a few GB, flashed sparse; the first boot grows it to the whole `userdata` partition (`resize2fs` in the initramfs, before mounting).
+**The device's root image** is an ext4 Arch Linux ARM root with Omarchy, the `[omamobile]` repository configured and its keyring, `omamobile-shell`, the device package installed and the matching kernel modules. It is built by `pacstrap` in an aarch64 container. It contains no Google file. Its size is a few GB, flashed sparse; the first boot grows it to the whole `userdata` partition (`resize2fs` in the initramfs, before mounting).
+
+The bundle's signed `SHA256SUMS` covers its `MANIFEST`, which names the exact root image and its SHA256 digest. The installer checks the selected image's name and bytes against that signed record before contacting the phone; changing the separate `.sha256` cannot authorize a replacement. Bundles use their own checked boot images; `--images` overrides are for repository mode. `--unsigned` remains available for development bundles, which use the root image's `.sha256` check.
 
 **`install`** (`tools/install-phone`), run on the laptop with the phone in fastboot:
 
@@ -317,6 +323,16 @@ CI never holds the signing key and never sees a factory image. The maintainer do
 - Rotation and revocation go through `omamobile-keyring`'s `omamobile-trusted` and `omamobile-revoked`, as Arch's keyring does.
 - **Publishing** (`tools/repo-publish`): `pkgs.omamobile.org` has two channels, `development/aarch64` and `stable/aarch64`. `repo-publish development` builds what changed (`build-packages --all`), checks every package's checksum and signature against `omamobile-keyring`'s trusted keys, and uploads packages first, then the index, then the pruning; each channel keeps the current and the previous index's files. `repo-publish stable` promotes development's signed files unchanged, after asking. The maintainer's laptop runs it daily from a clean `origin/main` checkout (`--from-main`, `tools/systemd/omamobile-publish.timer`), and `--remind` opens a "Ready for stable" issue when development has differed from stable for three days. Experimental phones' device packages are published to development only. The server account needs the `deployers` group.
 - Never commit, paste or upload a key, a passphrase or `keys/`. CI gets no key.
+- **Contributors' builds** (review lesson L-7). A port's own packages are signed with a local key that only that contributor's machine trusts, and everything lands under `out/<codename>/` and `keys/<codename>/`, never in the maintainer's `keys/` or `out/repo`:
+
+  ```sh
+  tools/local-key-init panther                       # once: keys/panther/{gnupg,fingerprint,public.asc}
+  tools/fetch-published out/panther/published        # pkgs.omamobile.org/development, each signature checked
+  tools/build-packages --local panther --import out/panther/published packages/omamobile-device-panther
+  KERNEL_OUT=... tools/build-rootfs --local panther  # out/panther/omamobile-rootfs-*.img.zst
+  ```
+
+  `tools/fetch-published` accepts the index and each package only when a key in `omamobile-keyring`'s `omamobile-trusted`, and not in `omamobile-revoked`, signed it, and each package only when it matches the signed index's SHA-256. `build-packages --local` keeps those packages' own `.sig` files, so only what it builds and the repository index carry the local key. The build image of `build-packages` and `build-rootfs --local` trusts the local key too (`ALARM_LOCAL_KEY`, locally signed in that image only). **The phone does not:** after the first boot, `pacman` refuses that `[omamobile]` index until the owner adds the key by hand (`pacman-key --add public.asc`, then `pacman-key --lsign-key <fingerprint>`). No package carries a contributor's key.
 
 ## 11. Release checklist
 
